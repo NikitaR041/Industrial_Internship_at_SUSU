@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+# Единый конвейер: best.pt -> ONNX -> RKNN (FP16 / INT8) одной командой.
+#
+#   convert models/best.pt                      # FP16, imgsz из чекпоинта
+#   convert models/best.pt --int8               # + PTQ INT8 (калибровка из /workspace/dataset)
+#   convert models/best.pt --imgsz 640          # явно задать вход
+#   convert models/best.pt --int8 --calib /workspace/dataset --ncalib 300
+#
+# Скрипт сам: определяет imgsz из чекпоинта, экспортирует ONNX через
+# Python API, проверяет выходы (batch, классы, сетки), генерирует
+# dataset.txt и собирает .rknn. Результаты кладёт рядом с .pt.
+
+import argparse
+import glob
+import os
+import random
+import sys
+
+GREEN, RED, YELLOW, RESET = "\033[92m", "\033[91m", "\033[93m", "\033[0m"
+
+
+def ok(msg):
+    print(f"{GREEN}[ok]{RESET} {msg}")
+
+
+def fail(msg):
+    print(f"{RED}[ошибка]{RESET} {msg}")
+    sys.exit(1)
+
+
+def warn(msg):
+    print(f"{YELLOW}[!]{RESET} {msg}")
+
+
+def step(n, msg):
+    print(f"\nШаг {n}: {msg}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="pt -> ONNX -> RKNN одной командой")
+    ap.add_argument("model", help="путь к .pt (например models/best.pt)")
+    ap.add_argument("--imgsz", type=int, default=None,
+                    help="вход модели; по умолчанию берётся из чекпоинта")
+    ap.add_argument("--int8", action="store_true", help="добавить PTQ INT8")
+    ap.add_argument("--calib", default="/workspace/dataset",
+                    help="папка с калибровочными картинками (для --int8)")
+    ap.add_argument("--ncalib", type=int, default=400,
+                    help="сколько картинок брать для калибровки")
+    ap.add_argument("--platform", default="rk3588", help="целевая платформа")
+    args = ap.parse_args()
+
+    pt_path = os.path.abspath(args.model)
+    if not os.path.isfile(pt_path):
+        fail(f"файл не найден: {pt_path}\n"
+             "Подсказка: смонтирована ли папка? docker run ... -v ${PWD}/models:/workspace/models ...")
+    base = os.path.splitext(pt_path)[0]
+    onnx_path = base + ".onnx"
+
+    # чтение параметров
+    step(1, "читаю параметры")
+    import torch
+    ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
+    train_args = ckpt.get("train_args", {}) or {}
+    names = getattr(ckpt.get("model", None), "names", None) or {}
+    nc_expected = len(names) if names else None
+    imgsz_train = train_args.get("imgsz")
+
+    imgsz = args.imgsz or imgsz_train
+    if imgsz is None:
+        fail("не удалось определить imgsz  — задай явно: --imgsz 640")
+    if args.imgsz and imgsz_train and args.imgsz != imgsz_train:
+        warn(f"--imgsz {args.imgsz} != imgsz обучения ({imgsz_train}). "
+             "Несовпадение снижает точность, особенно на мелких объектах.")
+    ok(f"imgsz = {imgsz}" + (f" (из обучения)" if not args.imgsz else ""))
+    if names:
+        ok(f"классов: {nc_expected} -> {list(names.values())}")
+
+    # экспорт в ONNX 
+    step(2, "экспорт pt -> ONNX (Python API, форк airockchip)")
+    from ultralytics import YOLO
+    YOLO(pt_path).export(format="rknn", imgsz=imgsz, batch=1)
+    if not os.path.isfile(onnx_path):
+        fail(f"ONNX не появился по пути {onnx_path}")
+    ok(f"экспортирован {onnx_path}")
+
+    # проверка ONNX
+    step(3, "проверка графа ONNX")
+    import onnx
+    m = onnx.load(onnx_path)
+    onnx.checker.check_model(m)
+    outs = [(o.name, [d.dim_value for d in o.type.tensor_type.shape.dim])
+            for o in m.graph.output]
+    for name, shape in outs:
+        print("   ", name, shape)
+    if len(outs) not in (6, 9):
+        fail(f"выходов {len(outs)}, жду 6 или 9 — экспорт прошёл не через форк airockchip")
+    if outs[0][1][0] != 1:
+        fail(f"batch = {outs[0][1][0]}, нужен 1")
+    grid = outs[0][1][2]
+    if grid * 8 != imgsz:
+        fail(f"сетка {grid} не соответствует imgsz {imgsz} (жду {imgsz // 8})")
+    nc_onnx = outs[1][1][1]
+    if nc_expected and nc_onnx != nc_expected:
+        fail(f"классов в ONNX {nc_onnx}, а в чекпоинте {nc_expected} — экспортировалась не та модель")
+    ok(f"batch=1, классов {nc_onnx}, сетки {grid}/{grid // 2}/{grid // 4}")
+
+    # сборка RKNN
+    from rknn.api import RKNN
+
+    def build(quant, suffix):
+        out_path = f"{base}_{suffix}.rknn"
+        rknn = RKNN(verbose=False)
+        rknn.config(mean_values=[[0, 0, 0]], std_values=[[255, 255, 255]],
+                    target_platform=args.platform)
+        if rknn.load_onnx(model=onnx_path) != 0:
+            fail("load_onnx failed")
+        dataset = None
+        if quant:
+            imgs = []
+            for ext in ("*.jpg", "*.jpeg", "*.png"):
+                imgs += glob.glob(os.path.join(args.calib, ext))
+            if len(imgs) < 20:
+                fail(f"в {args.calib} только {len(imgs)} картинок — для калибровки нужно 200+.\n"
+                     "Смонтируй папку: -v ${PWD}/dataset:/workspace/dataset")
+            random.seed(0)
+            random.shuffle(imgs)
+            imgs = imgs[: args.ncalib]
+            dataset = "/tmp/dataset.txt"
+            with open(dataset, "w") as f:
+                f.write("\n".join(imgs))
+            ok(f"калибровка: {len(imgs)} картинок из {args.calib}")
+        if rknn.build(do_quantization=quant, dataset=dataset) != 0:
+            fail("build failed" + (" (проверь калибровочные картинки)" if quant else ""))
+        if rknn.export_rknn(out_path) != 0:
+            fail("export_rknn failed")
+        rknn.release()
+        ok(f"собран {out_path} ({os.path.getsize(out_path) / 1e6:.1f} МБ)")
+        return out_path
+
+    step(4, "сборка RKNN FP16")
+    results = [build(False, "fp16")]
+    if args.int8:
+        step(5, "сборка RKNN INT8 (PTQ)")
+        results.append(build(True, "int8"))
+
+    # Итог 
+    print("ГОТОВО. Файлы (уже видны на хосте через смонтированную папку):")
+    for r in results:
+        print("  ", r)
+
+
+if __name__ == "__main__":
+    main()
